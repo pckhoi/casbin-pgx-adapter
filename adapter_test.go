@@ -110,22 +110,30 @@ func testAutoSave(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	require.NoError(t, err)
 }
 
-func testConstructorOptions(t *testing.T, a *Adapter, e *casbin.Enforcer) {
-	connStr := os.Getenv("PG_CONN")
-	require.NotEmpty(t, connStr, "must run with non-empty PG_CONN")
-	opts, err := pgx.ParseConfig(connStr)
+func testCustomDatabaseAndTableName(t *testing.T, a *Adapter, e *casbin.Enforcer) {
+	cfg, err := pgx.ParseConfig(os.Getenv("PG_CONN"))
 	require.NoError(t, err)
-
-	a, err = NewAdapter(opts, WithDatabase("test_pgxadapter"))
+	cfg.Database = "test_pgxadapter"
+	conn, err := pgx.ConnectConfig(context.Background(), cfg)
 	require.NoError(t, err)
-	defer a.Close()
+	defer conn.Close(context.Background())
 
-	e, err = casbin.NewEnforcer("testdata/rbac_model.conf", a)
+	var v0, v1, v2 string
+	policies := [][]string{}
+	_, err = conn.QueryFunc(context.Background(),
+		"SELECT v0, v1, v2 FROM test_casbin_rules WHERE p_type = $1",
+		[]interface{}{"p"}, []interface{}{&v0, &v1, &v2}, func(qfr pgx.QueryFuncRow) error {
+			policies = append(policies, []string{v0, v1, v2})
+			return nil
+		},
+	)
 	require.NoError(t, err)
-
-	assertPolicy(t,
-		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
-		e.GetPolicy(),
+	assert.Equal(t, [][]string{
+		{"alice", "data1", "read"},
+		{"bob", "data2", "write"},
+		{"data2_admin", "data2", "read"},
+		{"data2_admin", "data2", "write"}},
+		policies,
 	)
 }
 
@@ -308,7 +316,7 @@ func TestAdapter(t *testing.T) {
 	connStr := os.Getenv("PG_CONN")
 	require.NotEmpty(t, connStr, "must run with non-empty PG_CONN")
 	defer dropDB(t, "test_pgxadapter")
-	a, err := NewAdapter(connStr, WithDatabase("test_pgxadapter"))
+	a, err := NewAdapter(connStr, WithDatabase("test_pgxadapter"), WithTableName("test_casbin_rules"))
 	require.NoError(t, err)
 	defer a.Close()
 
@@ -332,7 +340,7 @@ func TestAdapter(t *testing.T) {
 			{"SavePolicyClearPreviousData", testSavePolicyClearPreviousData},
 			{"UpdatePolicy", testUpdatePolicy},
 			{"UpdatePolicyWithLoadFilteredPolicy", testUpdatePolicyWithLoadFilteredPolicy},
-			{"ConstructorOptions", testConstructorOptions},
+			{"CustomDatabaseAndTableName", testCustomDatabaseAndTableName},
 		} {
 			st := st
 			t.Run(st.Name, func(t *testing.T) {

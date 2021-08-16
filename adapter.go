@@ -468,5 +468,10 @@ func createDatabase(dbname string, arg interface{}) (*pgxpool.Pool, error) {
 		}
 	}
 
-	return pgxpool.Connect(ctx, config.ConnString())
+	cfg, err := pgxpool.ParseConfig(config.ConnString())
+	if err != nil {
+		return nil, err
+	}
+	cfg.ConnConfig.Database = dbname
+	return pgxpool.ConnectConfig(ctx, cfg)
 }
