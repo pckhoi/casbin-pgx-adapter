@@ -65,8 +65,8 @@ func main() {
 	e, _ := casbin.NewEnforcer("examples/rbac_model.conf", a)
 
 	e.LoadFilteredPolicy(&pgxadapter.Filter{
-		P: []string{"", "data1"},
-		G: []string{"alice"},
+		P: [][]string{{"", "data1"}},
+		G: [][]string{{"alice"}},
 	})
 	...
 }

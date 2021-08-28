@@ -31,8 +31,8 @@ type Adapter struct {
 }
 
 type Filter struct {
-	P []string
-	G []string
+	P [][]string
+	G [][]string
 }
 
 type Option func(a *Adapter)
@@ -289,49 +289,53 @@ func (a *Adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int,
 	return err
 }
 
-func (a *Adapter) queryPolicies(model model.Model, ptype string, values []string, handler func(string, model.Model)) error {
-	var sb strings.Builder
-	_, err := sb.WriteString(fmt.Sprintf(
-		`SELECT "v0", "v1", "v2", "v3", "v4", "v5" FROM %s WHERE p_type = $1`,
-		a.tableName,
-	))
-	if err != nil {
-		return err
-	}
-	args := []interface{}{ptype}
-	for ind, v := range values {
-		if v == "" {
-			continue
-		}
-		args = append(args, v)
-		_, err = sb.WriteString(fmt.Sprintf(" AND v%d = $%d", ind, len(args)))
-		if err != nil {
-			return err
+func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler func(string, model.Model)) error {
+	var (
+		ptype, v0, v1, v2, v3, v4, v5 pgtype.Text
+		args                          []interface{}
+		sb                            = &strings.Builder{}
+	)
+
+	fmt.Fprintf(sb, `SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s WHERE `, a.tableName)
+
+	buildQuery := func(policies [][]string, ptype string) {
+		if len(policies) > 0 {
+			args = append(args, ptype)
+			fmt.Fprintf(sb, `(p_type = $%d AND (`, len(args))
+			for i, p := range policies {
+				fmt.Fprint(sb, `(`)
+				for j, v := range p {
+					if v == "" {
+						continue
+					}
+					args = append(args, v)
+					fmt.Fprintf(sb, `v%d = $%d`, j, len(args))
+					if j < len(p)-1 {
+						fmt.Fprint(sb, ` AND `)
+					}
+				}
+				fmt.Fprint(sb, `)`)
+				if i < len(policies)-1 {
+					fmt.Fprint(sb, ` OR `)
+				}
+			}
+			fmt.Fprint(sb, `))`)
 		}
 	}
 
-	var v0, v1, v2, v3, v4, v5 pgtype.Text
+	buildQuery(filter.P, "p")
+	if len(filter.P) > 0 && len(filter.G) > 0 {
+		fmt.Fprint(sb, ` OR `)
+	}
+	buildQuery(filter.G, "g")
+
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	_, err = a.pool.QueryFunc(ctx, sb.String(), args, []interface{}{&v0, &v1, &v2, &v3, &v4, &v5}, func(qfr pgx.QueryFuncRow) error {
-		handler(policyLine(ptype, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
+	_, err := a.pool.QueryFunc(ctx, sb.String(), args, []interface{}{&ptype, &v0, &v1, &v2, &v3, &v4, &v5}, func(qfr pgx.QueryFuncRow) error {
+		handler(policyLine(ptype.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
 		return nil
 	})
 	return err
-}
-
-func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler func(string, model.Model)) error {
-	if filter.P != nil {
-		if err := a.queryPolicies(model, "p", filter.P, handler); err != nil {
-			return err
-		}
-	}
-	if filter.G != nil {
-		if err := a.queryPolicies(model, "g", filter.G, handler); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // LoadFilteredPolicy can query policies with a filter. Make sure that filter is of type *pgxadapter.Filter

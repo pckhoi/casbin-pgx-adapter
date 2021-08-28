@@ -187,14 +187,26 @@ func testRemoveFilteredPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 func testLoadFilteredPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	e, err := casbin.NewEnforcer("testdata/rbac_model.conf", a)
 	require.NoError(t, err)
-
 	err = e.LoadFilteredPolicy(&Filter{
-		P: []string{"", "", "read"},
+		P: [][]string{{"", "", "read"}},
 	})
 	require.NoError(t, err)
 	assert.True(t, e.IsFiltered())
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}, {"data2_admin", "data2", "read"}},
+		e.GetPolicy(),
+	)
+
+	// load multiple policy patterns at once
+	e, err = casbin.NewEnforcer("testdata/rbac_model.conf", a)
+	require.NoError(t, err)
+	err = e.LoadFilteredPolicy(&Filter{
+		P: [][]string{{"", "", "read"}, {"data2_admin"}},
+	})
+	require.NoError(t, err)
+	assert.True(t, e.IsFiltered())
+	assertPolicy(t,
+		[][]string{{"alice", "data1", "read"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
 		e.GetPolicy(),
 	)
 }
@@ -204,7 +216,7 @@ func testLoadFilteredGroupingPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer
 	require.NoError(t, err)
 
 	err = e.LoadFilteredPolicy(&Filter{
-		G: []string{"bob"},
+		G: [][]string{{"bob"}},
 	})
 	require.NoError(t, err)
 	assert.True(t, e.IsFiltered())
@@ -214,7 +226,7 @@ func testLoadFilteredGroupingPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer
 	require.NoError(t, err)
 
 	err = e.LoadFilteredPolicy(&Filter{
-		G: []string{"alice"},
+		G: [][]string{{"alice"}},
 	})
 	require.NoError(t, err)
 	assert.True(t, e.IsFiltered())
@@ -300,7 +312,7 @@ func testUpdatePolicyWithLoadFilteredPolicy(t *testing.T, a *Adapter, e *casbin.
 	err = e.SavePolicy()
 	require.NoError(t, err)
 
-	err = e.LoadFilteredPolicy(&Filter{P: []string{"data2_admin"}})
+	err = e.LoadFilteredPolicy(&Filter{P: [][]string{{"data2_admin"}}})
 	require.NoError(t, err)
 
 	_, err = e.UpdatePolicies(e.GetPolicy(), [][]string{{"bob", "data2", "read"}, {"alice", "data2", "write"}})
