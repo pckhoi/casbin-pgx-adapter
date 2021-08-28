@@ -1,4 +1,4 @@
-module github.com/pckhoi/casbin-pgx-adapter
+module github.com/pckhoi/casbin-pgx-adapter/v2
 
 go 1.16
 
