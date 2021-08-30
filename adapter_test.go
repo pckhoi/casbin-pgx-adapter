@@ -184,6 +184,28 @@ func testRemoveFilteredPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	)
 }
 
+func testRemoveFilteredGroupingPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
+	e.AddGroupingPolicy("bob", "data2_admin")
+	assertPolicy(t,
+		[][]string{{"alice", "data2_admin"}, {"bob", "data2_admin"}},
+		e.GetGroupingPolicy(),
+	)
+
+	_, err := e.RemoveFilteredGroupingPolicy(0, "alice")
+	require.NoError(t, err)
+	assertPolicy(t,
+		[][]string{{"bob", "data2_admin"}},
+		e.GetGroupingPolicy(),
+	)
+
+	err = e.LoadPolicy()
+	require.NoError(t, err)
+	assertPolicy(t,
+		[][]string{{"bob", "data2_admin"}},
+		e.GetGroupingPolicy(),
+	)
+}
+
 func testLoadFilteredPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	e, err := casbin.NewEnforcer("testdata/rbac_model.conf", a)
 	require.NoError(t, err)
@@ -346,6 +368,7 @@ func TestAdapter(t *testing.T) {
 			{"AutoSave", testAutoSave},
 			{"RemovePolicy", testRemovePolicy},
 			{"RemoveFilteredPolicy", testRemoveFilteredPolicy},
+			{"RemoveFilteredGroupingPolicy", testRemoveFilteredGroupingPolicy},
 			{"LoadFilteredPolicy", testLoadFilteredPolicy},
 			{"LoadFilteredGroupingPolicy", testLoadFilteredGroupingPolicy},
 			{"LoadFilteredPolicyNilFilter", testLoadFilteredPolicyNilFilter},
