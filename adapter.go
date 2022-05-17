@@ -25,6 +25,7 @@ type Adapter struct {
 	pool            *pgxpool.Pool
 	tableName       string
 	dbName          string
+	schema          string
 	timeout         time.Duration
 	skipTableCreate bool
 	filtered        bool
@@ -76,16 +77,27 @@ func WithSkipTableCreate() Option {
 	}
 }
 
-// WithTableName can be used to pass custom database name for Casbin rules
+// WithDatabase can be used to pass custom database name for Casbin rules
 func WithDatabase(dbname string) Option {
 	return func(a *Adapter) {
 		a.dbName = dbname
 	}
 }
 
+// WithTimeout can be used to pass a different timeout than DefaultTimeout
+// for each request to Postgres
 func WithTimeout(timeout time.Duration) Option {
 	return func(a *Adapter) {
 		a.timeout = timeout
+	}
+}
+
+// WithSchema can be used to pass a custom schema name. Note that the schema
+// name is case-sensitive. If you don't create the schema before hand, the
+// schema will be created for you.
+func WithSchema(s string) Option {
+	return func(a *Adapter) {
+		a.schema = s
 	}
 }
 
@@ -103,6 +115,20 @@ func policyLine(ptype string, values ...string) string {
 	return sb.String()
 }
 
+func (a *Adapter) tableIdentifier() pgx.Identifier {
+	if a.schema != "" {
+		return pgx.Identifier{a.schema, a.tableName}
+	}
+	return pgx.Identifier{a.tableName}
+}
+
+func (a *Adapter) schemaTable() string {
+	if a.schema != "" {
+		return fmt.Sprintf("%q.%s", a.schema, a.tableName)
+	}
+	return a.tableName
+}
+
 // LoadPolicy loads policy from database.
 func (a *Adapter) LoadPolicy(model model.Model) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
@@ -110,7 +136,7 @@ func (a *Adapter) LoadPolicy(model model.Model) error {
 	var pType, v0, v1, v2, v3, v4, v5 pgtype.Text
 	_, err := a.pool.QueryFunc(
 		ctx,
-		fmt.Sprintf(`SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s`, a.tableName),
+		fmt.Sprintf(`SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s`, a.schemaTable()),
 		nil,
 		[]interface{}{&pType, &v0, &v1, &v2, &v3, &v4, &v5},
 		func(pgx.QueryFuncRow) error {
@@ -176,13 +202,13 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
 	return a.pool.BeginFunc(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.tableName))
+		_, err := tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.schemaTable()))
 		if err != nil {
 			return err
 		}
 		_, err = tx.CopyFrom(
 			context.Background(),
-			pgx.Identifier{a.tableName},
+			a.tableIdentifier(),
 			[]string{"id", "p_type", "v0", "v1", "v2", "v3", "v4", "v5"},
 			pgx.CopyFromRows(rows),
 		)
@@ -194,7 +220,7 @@ func (a *Adapter) insertPolicyStmt() string {
 	return fmt.Sprintf(`
 		INSERT INTO %s (id, p_type, v0, v1, v2, v3, v4, v5)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT ON CONSTRAINT %s_pkey DO NOTHING
-	`, a.tableName, a.tableName)
+	`, a.schemaTable(), a.tableName)
 }
 
 // AddPolicy adds a policy rule to the storage.
@@ -235,7 +261,7 @@ func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
 	_, err := a.pool.Exec(ctx,
-		fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.tableName),
+		fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()),
 		id,
 	)
 	return err
@@ -249,7 +275,7 @@ func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) err
 		b := &pgx.Batch{}
 		for _, rule := range rules {
 			id := policyID(ptype, rule)
-			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.tableName), id)
+			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
 		}
 		br := tx.SendBatch(context.Background(), b)
 		defer br.Close()
@@ -266,7 +292,7 @@ func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) err
 // RemoveFilteredPolicy removes policy rules that match the filter from the storage.
 func (a *Adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int, fieldValues ...string) error {
 	var sb strings.Builder
-	_, err := sb.WriteString(fmt.Sprintf("DELETE FROM %s WHERE p_type = $1", a.tableName))
+	_, err := sb.WriteString(fmt.Sprintf("DELETE FROM %s WHERE p_type = $1", a.schemaTable()))
 	if err != nil {
 		return err
 	}
@@ -296,7 +322,7 @@ func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler 
 		sb                            = &strings.Builder{}
 	)
 
-	fmt.Fprintf(sb, `SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s WHERE `, a.tableName)
+	fmt.Fprintf(sb, `SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s WHERE `, a.schemaTable())
 
 	buildQuery := func(policies [][]string, ptype string) {
 		if len(policies) > 0 {
@@ -374,7 +400,7 @@ func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules []
 		b := &pgx.Batch{}
 		for _, rule := range oldRules {
 			id := policyID(ptype, rule)
-			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.tableName), id)
+			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
 		}
 		for _, rule := range newRules {
 			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
@@ -403,6 +429,13 @@ func (a *Adapter) Close() {
 }
 
 func (a *Adapter) createTable() error {
+	if a.schema != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+		defer cancel()
+		if _, err := a.pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %q`, a.schema)); err != nil {
+			return err
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
 	_, err := a.pool.Exec(ctx, fmt.Sprintf(`
@@ -416,7 +449,7 @@ func (a *Adapter) createTable() error {
 			v4 text,
 			v5 text
 		)
-	`, a.tableName))
+	`, a.schemaTable()))
 	return err
 }
 

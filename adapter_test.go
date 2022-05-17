@@ -391,3 +391,38 @@ func TestAdapter(t *testing.T) {
 		}
 	})
 }
+
+func TestCustomSchema(t *testing.T) {
+	connStr := os.Getenv("PG_CONN")
+	require.NotEmpty(t, connStr, "must run with non-empty PG_CONN")
+	defer dropDB(t, "test_pgxadapter")
+	a, err := NewAdapter(connStr, WithDatabase("test_pgxadapter"), WithSchema("My_Schema"))
+	require.NoError(t, err)
+	defer a.Close()
+
+	// save the policies
+	e, err := casbin.NewEnforcer("testdata/rbac_model.conf", "testdata/rbac_policy.csv")
+	require.NoError(t, err)
+	require.NoError(t, a.SavePolicy(e.GetModel()))
+
+	// reread the policies
+	e2, err := casbin.NewEnforcer("testdata/rbac_model.conf", a)
+	require.NoError(t, err)
+	assert.False(t, e2.IsFiltered())
+	assertPolicy(t,
+		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
+		e2.GetPolicy(),
+	)
+
+	// nothing found in public schema
+	a, err = NewAdapter(connStr, WithDatabase("test_pgxadapter"))
+	require.NoError(t, err)
+	defer a.Close()
+	e3, err := casbin.NewEnforcer("testdata/rbac_model.conf", a)
+	require.NoError(t, err)
+	assert.False(t, e3.IsFiltered())
+	assertPolicy(t,
+		[][]string{},
+		e3.GetPolicy(),
+	)
+}
