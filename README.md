@@ -88,7 +88,7 @@ import (
 func main() {
     conf, _ := pgx.ParseConfig("postgresql://pguser:pgpassword@localhost:5432/pgdb?sslmode=disable")
 
-    a, _ = NewAdapter(conf,
+    a, _ := pgxadapter.NewAdapter(conf,
         pgxadapter.WithDatabase("custom_database"),
         pgxadapter.WithTableName("custom_table"),
     )
