@@ -315,7 +315,7 @@ func (a *Adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int,
 	return err
 }
 
-func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler func(string, model.Model)) error {
+func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler func(string, model.Model) error) error {
 	var (
 		ptype, v0, v1, v2, v3, v4, v5 pgtype.Text
 		args                          []interface{}
