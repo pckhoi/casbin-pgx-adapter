@@ -123,10 +123,7 @@ func (a *Adapter) tableIdentifier() pgx.Identifier {
 }
 
 func (a *Adapter) schemaTable() string {
-	if a.schema != "" {
-		return fmt.Sprintf("%q.%s", a.schema, a.tableName)
-	}
-	return a.tableName
+	return a.tableIdentifier().Sanitize()
 }
 
 // LoadPolicy loads policy from database.
@@ -480,7 +477,7 @@ func createDatabase(dbname string, arg interface{}) (*pgxpool.Pool, error) {
 	rows.Close()
 
 	if createdb {
-		_, err = conn.Exec(ctx, "CREATE DATABASE "+dbname)
+		_, err = conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{dbname}.Sanitize())
 		if err != nil {
 			return nil, err
 		}

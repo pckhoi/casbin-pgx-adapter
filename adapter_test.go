@@ -396,7 +396,7 @@ func TestCustomSchema(t *testing.T) {
 	connStr := os.Getenv("PG_CONN")
 	require.NotEmpty(t, connStr, "must run with non-empty PG_CONN")
 	defer dropDB(t, "test_pgxadapter")
-	a, err := NewAdapter(connStr, WithDatabase("test_pgxadapter"), WithSchema("My_Schema"))
+	a, err := NewAdapter(connStr, WithDatabase("TestPgxAdapter"), WithSchema("MySchema"), WithTableName("TestCasbinRules"))
 	require.NoError(t, err)
 	defer a.Close()
 
