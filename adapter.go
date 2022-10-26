@@ -219,8 +219,8 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 func (a *Adapter) insertPolicyStmt() string {
 	return fmt.Sprintf(`
 		INSERT INTO %s (id, p_type, v0, v1, v2, v3, v4, v5)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT ON CONSTRAINT %s_pkey DO NOTHING
-	`, a.schemaTable(), a.tableName)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING
+	`, a.schemaTable())
 }
 
 // AddPolicy adds a policy rule to the storage.
