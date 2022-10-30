@@ -2,12 +2,14 @@ package pgxadapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/casbin/casbin/v2/model"
 	"github.com/casbin/casbin/v2/persist"
+	"github.com/jackc/pgconn"
 	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
@@ -430,24 +432,27 @@ func (a *Adapter) createTable() error {
 	if a.schema != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 		defer cancel()
-		if _, err := a.pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %q`, a.schema)); err != nil {
+		if _, err := a.pool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, pgx.Identifier{a.schema}.Sanitize())); err != nil {
 			return err
 		}
 	}
 	lowerTableName := strings.ToLower(a.tableName)
 	if a.tableName != DefaultTableName && lowerTableName != a.tableName {
-		schema := "public"
+		ident := pgx.Identifier{lowerTableName}
 		if a.schema != "" {
-			schema = a.schema
+			ident = pgx.Identifier{a.schema, lowerTableName}
 		}
 		exists := false
 		ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 		defer cancel()
-		if err := a.pool.QueryRow(ctx,
-			"SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = $1 AND tablename = $2)",
-			schema, lowerTableName,
+		if err := a.pool.QueryRow(ctx, fmt.Sprintf(
+			"SELECT EXISTS (SELECT COUNT(*) FROM (SELECT FROM %s LIMIT 1) a)",
+			ident.Sanitize()),
 		).Scan(&exists); err != nil {
-			return err
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "42P01" {
+				return err
+			}
 		}
 		if exists {
 			return fmt.Errorf("found table with similar name only in lower case: %q. Either use this table name exactly, or choose a different name", lowerTableName)
