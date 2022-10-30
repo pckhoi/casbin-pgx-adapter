@@ -2,6 +2,7 @@ package pgxadapter
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 
@@ -396,7 +397,7 @@ func TestCustomSchema(t *testing.T) {
 	connStr := os.Getenv("PG_CONN")
 	require.NotEmpty(t, connStr, "must run with non-empty PG_CONN")
 	defer dropDB(t, "test_pgxadapter")
-	a, err := NewAdapter(connStr, WithDatabase("test_pgxadapter"), WithSchema("My_Schema"))
+	a, err := NewAdapter(connStr, WithDatabase("test_pgxadapter"), WithSchema("My_Schema"), WithTableName("TestCasbinRules"))
 	require.NoError(t, err)
 	defer a.Close()
 
@@ -425,4 +426,35 @@ func TestCustomSchema(t *testing.T) {
 		[][]string{},
 		e3.GetPolicy(),
 	)
+}
+
+func TestRejectCollidingTableName(t *testing.T) {
+	connStr := os.Getenv("PG_CONN")
+	require.NotEmpty(t, connStr, "must run with non-empty PG_CONN")
+	dbName := "test_pgxadapter"
+	pool, err := createDatabase(dbName, connStr)
+	require.NoError(t, err)
+	defer dropDB(t, dbName)
+	defer pool.Close()
+	ctx := context.Background()
+	_, err = pool.Exec(ctx, `
+		CREATE TABLE test_casbin_rules (
+			id text PRIMARY KEY,
+			p_type text,
+			v0 text,
+			v1 text,
+			v2 text,
+			v3 text,
+			v4 text,
+			v5 text
+		)
+	`)
+	require.NoError(t, err)
+
+	_, err = NewAdapter(connStr, WithDatabase(dbName), WithTableName("Test_Casbin_Rules"))
+	assert.Equal(t, fmt.Errorf("pgxadapter.NewAdapter: found table with similar name only in lower case: \"test_casbin_rules\". Either use this table name exactly, or choose a different name"), err)
+
+	a, err := NewAdapter(connStr, WithDatabase(dbName), WithTableName("test_casbin_rules"))
+	require.NoError(t, err)
+	defer a.Close()
 }

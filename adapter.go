@@ -56,6 +56,7 @@ func NewAdapter(conn interface{}, opts ...Option) (*Adapter, error) {
 	a.pool = pool
 	if !a.skipTableCreate {
 		if err := a.createTable(); err != nil {
+			a.pool.Close()
 			return nil, fmt.Errorf("pgxadapter.NewAdapter: %v", err)
 		}
 	}
@@ -123,10 +124,7 @@ func (a *Adapter) tableIdentifier() pgx.Identifier {
 }
 
 func (a *Adapter) schemaTable() string {
-	if a.schema != "" {
-		return fmt.Sprintf("%q.%s", a.schema, a.tableName)
-	}
-	return a.tableName
+	return a.tableIdentifier().Sanitize()
 }
 
 // LoadPolicy loads policy from database.
@@ -219,8 +217,8 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 func (a *Adapter) insertPolicyStmt() string {
 	return fmt.Sprintf(`
 		INSERT INTO %s (id, p_type, v0, v1, v2, v3, v4, v5)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT ON CONSTRAINT %s_pkey DO NOTHING
-	`, a.schemaTable(), a.tableName)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING
+	`, a.schemaTable())
 }
 
 // AddPolicy adds a policy rule to the storage.
@@ -436,6 +434,25 @@ func (a *Adapter) createTable() error {
 			return err
 		}
 	}
+	lowerTableName := strings.ToLower(a.tableName)
+	if a.tableName != DefaultTableName && lowerTableName != a.tableName {
+		schema := "public"
+		if a.schema != "" {
+			schema = a.schema
+		}
+		exists := false
+		ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+		defer cancel()
+		if err := a.pool.QueryRow(ctx,
+			"SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = $1 AND tablename = $2)",
+			schema, lowerTableName,
+		).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			return fmt.Errorf("found table with similar name only in lower case: %q. Either use this table name exactly, or choose a different name", lowerTableName)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
 	_, err := a.pool.Exec(ctx, fmt.Sprintf(`
@@ -480,7 +497,7 @@ func createDatabase(dbname string, arg interface{}) (*pgxpool.Pool, error) {
 	rows.Close()
 
 	if createdb {
-		_, err = conn.Exec(ctx, "CREATE DATABASE "+dbname)
+		_, err = conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{dbname}.Sanitize())
 		if err != nil {
 			return nil, err
 		}
