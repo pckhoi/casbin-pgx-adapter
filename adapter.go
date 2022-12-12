@@ -9,10 +9,10 @@ import (
 
 	"github.com/casbin/casbin/v2/model"
 	"github.com/casbin/casbin/v2/persist"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgtype"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mmcloughlin/meow"
 )
 
@@ -134,16 +134,22 @@ func (a *Adapter) LoadPolicy(model model.Model) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
 	var pType, v0, v1, v2, v3, v4, v5 pgtype.Text
-	_, err := a.pool.QueryFunc(
-		ctx,
-		fmt.Sprintf(`SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s`, a.schemaTable()),
-		nil,
-		[]interface{}{&pType, &v0, &v1, &v2, &v3, &v4, &v5},
-		func(pgx.QueryFuncRow) error {
-			persist.LoadPolicyLine(policyLine(pType.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
-			return nil
-		},
-	)
+	rows, err := a.pool.Query(ctx, fmt.Sprintf(`SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s`, a.schemaTable()))
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		err = rows.Scan(&pType, &v0, &v1, &v2, &v3, &v4, &v5)
+		if err != nil {
+			break
+		}
+		persist.LoadPolicyLine(policyLine(pType.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
+	}
+	rows.Close()
+	if err == nil {
+		err = rows.Err()
+	}
+
 	if err != nil {
 		return err
 	}
@@ -163,22 +169,22 @@ func policyArgs(ptype string, rule []string) []interface{} {
 	row := make([]interface{}, 8)
 	row[0] = pgtype.Text{
 		String: policyID(ptype, rule),
-		Status: pgtype.Present,
+		Valid:  true,
 	}
 	row[1] = pgtype.Text{
 		String: ptype,
-		Status: pgtype.Present,
+		Valid:  true,
 	}
 	l := len(rule)
 	for i := 0; i < 6; i++ {
 		if i < l {
 			row[2+i] = pgtype.Text{
 				String: rule[i],
-				Status: pgtype.Present,
+				Valid:  true,
 			}
 		} else {
 			row[2+i] = pgtype.Text{
-				Status: pgtype.Null,
+				Valid: false,
 			}
 		}
 	}
@@ -201,19 +207,26 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return a.pool.BeginFunc(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.schemaTable()))
-		if err != nil {
-			return err
-		}
-		_, err = tx.CopyFrom(
-			context.Background(),
-			a.tableIdentifier(),
-			[]string{"id", "p_type", "v0", "v1", "v2", "v3", "v4", "v5"},
-			pgx.CopyFromRows(rows),
-		)
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
 		return err
-	})
+	}
+	_, err = tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.schemaTable()))
+	if err != nil {
+		tx.Rollback(context.Background())
+		return err
+	}
+	_, err = tx.CopyFrom(
+		context.Background(),
+		a.tableIdentifier(),
+		[]string{"id", "p_type", "v0", "v1", "v2", "v3", "v4", "v5"},
+		pgx.CopyFromRows(rows),
+	)
+	if err != nil {
+		tx.Rollback(context.Background())
+		return err
+	}
+	return tx.Commit(context.Background())
 }
 
 func (a *Adapter) insertPolicyStmt() string {
@@ -238,21 +251,29 @@ func (a *Adapter) AddPolicy(sec string, ptype string, rule []string) error {
 func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return a.pool.BeginFunc(ctx, func(tx pgx.Tx) error {
-		b := &pgx.Batch{}
-		for _, rule := range rules {
-			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	b := &pgx.Batch{}
+	for _, rule := range rules {
+		b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
+	}
+	br := tx.SendBatch(context.Background(), b)
+	for range rules {
+		_, err := br.Exec()
+		if err != nil {
+			br.Close()
+			tx.Rollback(context.Background())
+			return err
 		}
-		br := tx.SendBatch(context.Background(), b)
-		defer br.Close()
-		for range rules {
-			_, err := br.Exec()
-			if err != nil {
-				return err
-			}
-		}
-		return br.Close()
-	})
+	}
+	err = br.Close()
+	if err != nil {
+		tx.Rollback(context.Background())
+		return err
+	}
+	return tx.Commit(context.Background())
 }
 
 // RemovePolicy removes a policy rule from the storage.
@@ -271,22 +292,30 @@ func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return a.pool.BeginFunc(ctx, func(tx pgx.Tx) error {
-		b := &pgx.Batch{}
-		for _, rule := range rules {
-			id := policyID(ptype, rule)
-			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	b := &pgx.Batch{}
+	for _, rule := range rules {
+		id := policyID(ptype, rule)
+		b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
+	}
+	br := tx.SendBatch(context.Background(), b)
+	for range rules {
+		_, err := br.Exec()
+		if err != nil {
+			br.Close()
+			tx.Rollback(context.Background())
+			return err
 		}
-		br := tx.SendBatch(context.Background(), b)
-		defer br.Close()
-		for range rules {
-			_, err := br.Exec()
-			if err != nil {
-				return err
-			}
-		}
-		return br.Close()
-	})
+	}
+	err = br.Close()
+	if err != nil {
+		tx.Rollback(context.Background())
+		return err
+	}
+	return tx.Commit(context.Background())
 }
 
 // RemoveFilteredPolicy removes policy rules that match the filter from the storage.
@@ -357,10 +386,24 @@ func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler 
 
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	_, err := a.pool.QueryFunc(ctx, sb.String(), args, []interface{}{&ptype, &v0, &v1, &v2, &v3, &v4, &v5}, func(qfr pgx.QueryFuncRow) error {
+	rows, err := a.pool.Query(ctx, sb.String(), args...)
+	if err != nil {
+		return err
+	}
+
+	for rows.Next() {
+		err = rows.Scan(&ptype, &v0, &v1, &v2, &v3, &v4, &v5)
+		if err != nil {
+			break
+		}
 		handler(policyLine(ptype.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
-		return nil
-	})
+	}
+
+	rows.Close()
+
+	if err == nil {
+		err = rows.Err()
+	}
 	return err
 }
 
@@ -396,25 +439,33 @@ func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []st
 func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return a.pool.BeginFunc(ctx, func(t pgx.Tx) error {
-		b := &pgx.Batch{}
-		for _, rule := range oldRules {
-			id := policyID(ptype, rule)
-			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	b := &pgx.Batch{}
+	for _, rule := range oldRules {
+		id := policyID(ptype, rule)
+		b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
+	}
+	for _, rule := range newRules {
+		b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
+	}
+	br := tx.SendBatch(context.Background(), b)
+	for i := 0; i < b.Len(); i++ {
+		_, err := br.Exec()
+		if err != nil {
+			br.Close()
+			tx.Rollback(context.Background())
+			return err
 		}
-		for _, rule := range newRules {
-			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
-		}
-		br := t.SendBatch(context.Background(), b)
-		defer br.Close()
-		for i := 0; i < b.Len(); i++ {
-			_, err := br.Exec()
-			if err != nil {
-				return err
-			}
-		}
-		return br.Close()
-	})
+	}
+	err = br.Close()
+	if err != nil {
+		tx.Rollback(context.Background())
+		return err
+	}
+	return tx.Commit(context.Background())
 }
 
 // UpdateFilteredPolicies deletes old rules and adds new rules.
@@ -532,5 +583,5 @@ func createDatabase(dbname string, arg interface{}) (*pgxpool.Pool, error) {
 		return nil, err
 	}
 	cfg.ConnConfig.Database = dbname
-	return pgxpool.ConnectConfig(ctx, cfg)
+	return pgxpool.NewWithConfig(ctx, cfg)
 }
