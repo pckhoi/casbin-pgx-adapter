@@ -123,14 +123,10 @@ func testCustomDatabaseAndTableName(t *testing.T, a *Adapter, e *casbin.Enforcer
 	policies := [][]string{}
 	rows, err := conn.Query(context.Background(), "SELECT v0, v1, v2 FROM test_casbin_rules WHERE p_type = $1", "p")
 	require.NoError(t, err)
-	for rows.Next() {
-		err = rows.Scan(&v0, &v1, &v2)
-		require.NoError(t, err)
+	pgx.ForEachRow(rows, []interface{}{&v0, &v1, &v2}, func() error {
 		policies = append(policies, []string{v0, v1, v2})
-	}
-	rows.Close()
-	err = rows.Err()
-	require.NoError(t, err)
+		return nil
+	})
 	assert.Equal(t, [][]string{
 		{"alice", "data1", "read"},
 		{"bob", "data2", "write"},
