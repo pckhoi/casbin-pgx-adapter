@@ -138,18 +138,10 @@ func (a *Adapter) LoadPolicy(model model.Model) error {
 	if err != nil {
 		return err
 	}
-	for rows.Next() {
-		err = rows.Scan(&pType, &v0, &v1, &v2, &v3, &v4, &v5)
-		if err != nil {
-			break
-		}
+	_, err = pgx.ForEachRow(rows, []interface{}{&pType, &v0, &v1, &v2, &v3, &v4, &v5}, func() error {
 		persist.LoadPolicyLine(policyLine(pType.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
-	}
-	rows.Close()
-	if err == nil {
-		err = rows.Err()
-	}
-
+		return nil
+	})
 	if err != nil {
 		return err
 	}
@@ -207,26 +199,19 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	tx, err := a.pool.Begin(ctx)
-	if err != nil {
+	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.schemaTable()))
+		if err != nil {
+			return err
+		}
+		_, err = tx.CopyFrom(
+			context.Background(),
+			a.tableIdentifier(),
+			[]string{"id", "p_type", "v0", "v1", "v2", "v3", "v4", "v5"},
+			pgx.CopyFromRows(rows),
+		)
 		return err
-	}
-	_, err = tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.schemaTable()))
-	if err != nil {
-		tx.Rollback(context.Background())
-		return err
-	}
-	_, err = tx.CopyFrom(
-		context.Background(),
-		a.tableIdentifier(),
-		[]string{"id", "p_type", "v0", "v1", "v2", "v3", "v4", "v5"},
-		pgx.CopyFromRows(rows),
-	)
-	if err != nil {
-		tx.Rollback(context.Background())
-		return err
-	}
-	return tx.Commit(context.Background())
+	})
 }
 
 func (a *Adapter) insertPolicyStmt() string {
@@ -251,29 +236,21 @@ func (a *Adapter) AddPolicy(sec string, ptype string, rule []string) error {
 func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	tx, err := a.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	b := &pgx.Batch{}
-	for _, rule := range rules {
-		b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
-	}
-	br := tx.SendBatch(context.Background(), b)
-	for range rules {
-		_, err := br.Exec()
-		if err != nil {
-			br.Close()
-			tx.Rollback(context.Background())
-			return err
+	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+		b := &pgx.Batch{}
+		for _, rule := range rules {
+			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
 		}
-	}
-	err = br.Close()
-	if err != nil {
-		tx.Rollback(context.Background())
-		return err
-	}
-	return tx.Commit(context.Background())
+		br := tx.SendBatch(context.Background(), b)
+		for range rules {
+			_, err := br.Exec()
+			if err != nil {
+				br.Close()
+				return err
+			}
+		}
+		return br.Close()
+	})
 }
 
 // RemovePolicy removes a policy rule from the storage.
@@ -292,30 +269,21 @@ func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	tx, err := a.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	b := &pgx.Batch{}
-	for _, rule := range rules {
-		id := policyID(ptype, rule)
-		b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
-	}
-	br := tx.SendBatch(context.Background(), b)
-	for range rules {
-		_, err := br.Exec()
-		if err != nil {
-			br.Close()
-			tx.Rollback(context.Background())
-			return err
+	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+		b := &pgx.Batch{}
+		for _, rule := range rules {
+			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), policyID(ptype, rule))
 		}
-	}
-	err = br.Close()
-	if err != nil {
-		tx.Rollback(context.Background())
-		return err
-	}
-	return tx.Commit(context.Background())
+		br := tx.SendBatch(context.Background(), b)
+		for range rules {
+			_, err := br.Exec()
+			if err != nil {
+				br.Close()
+				return err
+			}
+		}
+		return br.Close()
+	})
 }
 
 // RemoveFilteredPolicy removes policy rules that match the filter from the storage.
@@ -390,20 +358,10 @@ func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler 
 	if err != nil {
 		return err
 	}
-
-	for rows.Next() {
-		err = rows.Scan(&ptype, &v0, &v1, &v2, &v3, &v4, &v5)
-		if err != nil {
-			break
-		}
+	_, err = pgx.ForEachRow(rows, []interface{}{&ptype, &v0, &v1, &v2, &v3, &v4, &v5}, func() error {
 		handler(policyLine(ptype.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
-	}
-
-	rows.Close()
-
-	if err == nil {
-		err = rows.Err()
-	}
+		return nil
+	})
 	return err
 }
 
@@ -439,33 +397,24 @@ func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []st
 func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	tx, err := a.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	b := &pgx.Batch{}
-	for _, rule := range oldRules {
-		id := policyID(ptype, rule)
-		b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
-	}
-	for _, rule := range newRules {
-		b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
-	}
-	br := tx.SendBatch(context.Background(), b)
-	for i := 0; i < b.Len(); i++ {
-		_, err := br.Exec()
-		if err != nil {
-			br.Close()
-			tx.Rollback(context.Background())
-			return err
+	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+		b := &pgx.Batch{}
+		for _, rule := range oldRules {
+			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), policyID(ptype, rule))
 		}
-	}
-	err = br.Close()
-	if err != nil {
-		tx.Rollback(context.Background())
-		return err
-	}
-	return tx.Commit(context.Background())
+		for _, rule := range newRules {
+			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
+		}
+		br := tx.SendBatch(context.Background(), b)
+		for i := 0; i < b.Len(); i++ {
+			_, err := br.Exec()
+			if err != nil {
+				br.Close()
+				return err
+			}
+		}
+		return br.Close()
+	})
 }
 
 // UpdateFilteredPolicies deletes old rules and adds new rules.
