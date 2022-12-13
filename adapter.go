@@ -22,7 +22,7 @@ const (
 	DefaultTimeout      = time.Second * 10
 )
 
-// Adapter represents the github.com/jackc/pgx/v4 adapter for policy storage.
+// Adapter represents the github.com/jackc/pgx/v5 adapter for policy storage.
 type Adapter struct {
 	pool            *pgxpool.Pool
 	tableName       string
@@ -41,7 +41,7 @@ type Filter struct {
 type Option func(a *Adapter)
 
 // NewAdapter creates a new adapter with connection conn which must either be a PostgreSQL
-// connection string or an instance of *pgx.ConnConfig from package github.com/jackc/pgx/v4.
+// connection string or an instance of *pgx.ConnConfig from package github.com/jackc/pgx/v5.
 func NewAdapter(conn interface{}, opts ...Option) (*Adapter, error) {
 	a := &Adapter{
 		dbName:    DefaultDatabaseName,
