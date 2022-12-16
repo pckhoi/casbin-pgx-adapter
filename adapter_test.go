@@ -8,7 +8,7 @@ import (
 
 	"github.com/casbin/casbin/v2"
 	"github.com/casbin/casbin/v2/util"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -121,14 +121,12 @@ func testCustomDatabaseAndTableName(t *testing.T, a *Adapter, e *casbin.Enforcer
 
 	var v0, v1, v2 string
 	policies := [][]string{}
-	_, err = conn.QueryFunc(context.Background(),
-		"SELECT v0, v1, v2 FROM test_casbin_rules WHERE p_type = $1",
-		[]interface{}{"p"}, []interface{}{&v0, &v1, &v2}, func(qfr pgx.QueryFuncRow) error {
-			policies = append(policies, []string{v0, v1, v2})
-			return nil
-		},
-	)
+	rows, err := conn.Query(context.Background(), "SELECT v0, v1, v2 FROM test_casbin_rules WHERE p_type = $1", "p")
 	require.NoError(t, err)
+	pgx.ForEachRow(rows, []interface{}{&v0, &v1, &v2}, func() error {
+		policies = append(policies, []string{v0, v1, v2})
+		return nil
+	})
 	assert.Equal(t, [][]string{
 		{"alice", "data1", "read"},
 		{"bob", "data2", "write"},

@@ -9,10 +9,10 @@ import (
 
 	"github.com/casbin/casbin/v2/model"
 	"github.com/casbin/casbin/v2/persist"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgtype"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mmcloughlin/meow"
 )
 
@@ -22,7 +22,7 @@ const (
 	DefaultTimeout      = time.Second * 10
 )
 
-// Adapter represents the github.com/jackc/pgx/v4 adapter for policy storage.
+// Adapter represents the github.com/jackc/pgx/v5 adapter for policy storage.
 type Adapter struct {
 	pool            *pgxpool.Pool
 	tableName       string
@@ -41,7 +41,7 @@ type Filter struct {
 type Option func(a *Adapter)
 
 // NewAdapter creates a new adapter with connection conn which must either be a PostgreSQL
-// connection string or an instance of *pgx.ConnConfig from package github.com/jackc/pgx/v4.
+// connection string or an instance of *pgx.ConnConfig from package github.com/jackc/pgx/v5.
 func NewAdapter(conn interface{}, opts ...Option) (*Adapter, error) {
 	a := &Adapter{
 		dbName:    DefaultDatabaseName,
@@ -134,16 +134,14 @@ func (a *Adapter) LoadPolicy(model model.Model) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
 	var pType, v0, v1, v2, v3, v4, v5 pgtype.Text
-	_, err := a.pool.QueryFunc(
-		ctx,
-		fmt.Sprintf(`SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s`, a.schemaTable()),
-		nil,
-		[]interface{}{&pType, &v0, &v1, &v2, &v3, &v4, &v5},
-		func(pgx.QueryFuncRow) error {
-			persist.LoadPolicyLine(policyLine(pType.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
-			return nil
-		},
-	)
+	rows, err := a.pool.Query(ctx, fmt.Sprintf(`SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s`, a.schemaTable()))
+	if err != nil {
+		return err
+	}
+	_, err = pgx.ForEachRow(rows, []interface{}{&pType, &v0, &v1, &v2, &v3, &v4, &v5}, func() error {
+		persist.LoadPolicyLine(policyLine(pType.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
+		return nil
+	})
 	if err != nil {
 		return err
 	}
@@ -163,22 +161,22 @@ func policyArgs(ptype string, rule []string) []interface{} {
 	row := make([]interface{}, 8)
 	row[0] = pgtype.Text{
 		String: policyID(ptype, rule),
-		Status: pgtype.Present,
+		Valid:  true,
 	}
 	row[1] = pgtype.Text{
 		String: ptype,
-		Status: pgtype.Present,
+		Valid:  true,
 	}
 	l := len(rule)
 	for i := 0; i < 6; i++ {
 		if i < l {
 			row[2+i] = pgtype.Text{
 				String: rule[i],
-				Status: pgtype.Present,
+				Valid:  true,
 			}
 		} else {
 			row[2+i] = pgtype.Text{
-				Status: pgtype.Null,
+				Valid: false,
 			}
 		}
 	}
@@ -201,7 +199,7 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return a.pool.BeginFunc(ctx, func(tx pgx.Tx) error {
+	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		_, err := tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.schemaTable()))
 		if err != nil {
 			return err
@@ -238,16 +236,16 @@ func (a *Adapter) AddPolicy(sec string, ptype string, rule []string) error {
 func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return a.pool.BeginFunc(ctx, func(tx pgx.Tx) error {
+	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		b := &pgx.Batch{}
 		for _, rule := range rules {
 			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
 		}
 		br := tx.SendBatch(context.Background(), b)
-		defer br.Close()
 		for range rules {
 			_, err := br.Exec()
 			if err != nil {
+				br.Close()
 				return err
 			}
 		}
@@ -271,17 +269,16 @@ func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return a.pool.BeginFunc(ctx, func(tx pgx.Tx) error {
+	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		b := &pgx.Batch{}
 		for _, rule := range rules {
-			id := policyID(ptype, rule)
-			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
+			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), policyID(ptype, rule))
 		}
 		br := tx.SendBatch(context.Background(), b)
-		defer br.Close()
 		for range rules {
 			_, err := br.Exec()
 			if err != nil {
+				br.Close()
 				return err
 			}
 		}
@@ -357,7 +354,11 @@ func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler 
 
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	_, err := a.pool.QueryFunc(ctx, sb.String(), args, []interface{}{&ptype, &v0, &v1, &v2, &v3, &v4, &v5}, func(qfr pgx.QueryFuncRow) error {
+	rows, err := a.pool.Query(ctx, sb.String(), args...)
+	if err != nil {
+		return err
+	}
+	_, err = pgx.ForEachRow(rows, []interface{}{&ptype, &v0, &v1, &v2, &v3, &v4, &v5}, func() error {
 		handler(policyLine(ptype.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
 		return nil
 	})
@@ -396,20 +397,19 @@ func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []st
 func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
-	return a.pool.BeginFunc(ctx, func(t pgx.Tx) error {
+	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		b := &pgx.Batch{}
 		for _, rule := range oldRules {
-			id := policyID(ptype, rule)
-			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), id)
+			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), policyID(ptype, rule))
 		}
 		for _, rule := range newRules {
 			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
 		}
-		br := t.SendBatch(context.Background(), b)
-		defer br.Close()
+		br := tx.SendBatch(context.Background(), b)
 		for i := 0; i < b.Len(); i++ {
 			_, err := br.Exec()
 			if err != nil {
+				br.Close()
 				return err
 			}
 		}
@@ -532,5 +532,5 @@ func createDatabase(dbname string, arg interface{}) (*pgxpool.Pool, error) {
 		return nil, err
 	}
 	cfg.ConnConfig.Database = dbname
-	return pgxpool.ConnectConfig(ctx, cfg)
+	return pgxpool.NewWithConfig(ctx, cfg)
 }
