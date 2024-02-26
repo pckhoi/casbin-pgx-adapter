@@ -99,7 +99,7 @@ func WithTimeout(timeout time.Duration) Option {
 	}
 }
 
-// WithPool can be used to pass an existing *pgxpool.Pool instance
+// WithConnectionPool can be used to pass an existing *pgxpool.Pool instance
 func WithConnectionPool(pool *pgxpool.Pool) Option {
 	return func(a *Adapter) {
 		a.pool = pool
