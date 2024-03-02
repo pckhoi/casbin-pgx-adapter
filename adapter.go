@@ -51,11 +51,15 @@ func NewAdapter(conn interface{}, opts ...Option) (*Adapter, error) {
 	for _, opt := range opts {
 		opt(a)
 	}
-	pool, err := createDatabase(a.dbName, conn)
-	if err != nil {
-		return nil, fmt.Errorf("pgxadapter.NewAdapter: %v", err)
+
+	if a.pool == nil {
+		pool, err := createDatabase(a.dbName, conn)
+		if err != nil {
+			return nil, fmt.Errorf("pgxadapter.NewAdapter: %v", err)
+		}
+		a.pool = pool
 	}
-	a.pool = pool
+
 	if !a.skipTableCreate {
 		if err := a.createTable(); err != nil {
 			a.pool.Close()
@@ -92,6 +96,13 @@ func WithDatabase(dbname string) Option {
 func WithTimeout(timeout time.Duration) Option {
 	return func(a *Adapter) {
 		a.timeout = timeout
+	}
+}
+
+// WithConnectionPool can be used to pass an existing *pgxpool.Pool instance
+func WithConnectionPool(pool *pgxpool.Pool) Option {
+	return func(a *Adapter) {
+		a.pool = pool
 	}
 }
 
