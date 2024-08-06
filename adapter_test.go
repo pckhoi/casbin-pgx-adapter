@@ -30,9 +30,11 @@ func assertPolicy(t *testing.T, expected, res [][]string) {
 
 func testSaveLoad(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	assert.False(t, e.IsFiltered())
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
-		e.GetPolicy(),
+		res,
 	)
 }
 
@@ -49,9 +51,11 @@ func testAutoSave(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	err = e.LoadPolicy()
 	require.NoError(t, err)
 	// This is still the original policy.
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
-		e.GetPolicy(),
+		res,
 	)
 
 	// Now we enable the AutoSave.
@@ -65,9 +69,11 @@ func testAutoSave(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	err = e.LoadPolicy()
 	require.NoError(t, err)
 	// The policy has a new rule: {"alice", "data1", "write"}.
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}, {"alice", "data1", "write"}},
-		e.GetPolicy(),
+		res,
 	)
 
 	// Aditional AddPolicy have no effect
@@ -75,9 +81,11 @@ func testAutoSave(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	require.NoError(t, err)
 	err = e.LoadPolicy()
 	require.NoError(t, err)
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}, {"alice", "data1", "write"}},
-		e.GetPolicy(),
+		res,
 	)
 
 	_, err = e.AddPolicies([][]string{
@@ -92,6 +100,8 @@ func testAutoSave(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	err = e.LoadPolicy()
 	require.NoError(t, err)
 	// The policy has a new rule: {"alice", "data1", "write"}.
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{
 			{"alice", "data1", "read"},
@@ -105,7 +115,7 @@ func testAutoSave(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 			{"bob", "data1", "write"},
 			{"bob", "data1", "read"},
 		},
-		e.GetPolicy(),
+		res,
 	)
 
 	require.NoError(t, err)
@@ -140,17 +150,21 @@ func testRemovePolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	_, err := e.RemovePolicy("alice", "data1", "read")
 	require.NoError(t, err)
 
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
-		e.GetPolicy(),
+		res,
 	)
 
 	err = e.LoadPolicy()
 	require.NoError(t, err)
 
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
-		e.GetPolicy(),
+		res,
 	)
 
 	_, err = e.RemovePolicies([][]string{
@@ -159,9 +173,11 @@ func testRemovePolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	})
 	require.NoError(t, err)
 
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"bob", "data2", "write"}},
-		e.GetPolicy(),
+		res,
 	)
 }
 
@@ -169,39 +185,50 @@ func testRemoveFilteredPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	_, err := e.RemoveFilteredPolicy(0, "", "data2")
 	require.NoError(t, err)
 
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}},
-		e.GetPolicy(),
+		res,
 	)
 
 	err = e.LoadPolicy()
 	require.NoError(t, err)
 
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}},
-		e.GetPolicy(),
+		res,
 	)
 }
 
 func testRemoveFilteredGroupingPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	e.AddGroupingPolicy("bob", "data2_admin")
+	res, err := e.GetGroupingPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data2_admin"}, {"bob", "data2_admin"}},
-		e.GetGroupingPolicy(),
+		res,
 	)
 
-	_, err := e.RemoveFilteredGroupingPolicy(0, "alice")
+	_, err = e.RemoveFilteredGroupingPolicy(0, "alice")
+	require.NoError(t, err)
+
+	res, err = e.GetGroupingPolicy()
 	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"bob", "data2_admin"}},
-		e.GetGroupingPolicy(),
+		res,
 	)
 
 	err = e.LoadPolicy()
 	require.NoError(t, err)
+	res, err = e.GetGroupingPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"bob", "data2_admin"}},
-		e.GetGroupingPolicy(),
+		res,
 	)
 }
 
@@ -213,9 +240,11 @@ func testLoadFilteredPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	})
 	require.NoError(t, err)
 	assert.True(t, e.IsFiltered())
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}, {"data2_admin", "data2", "read"}},
-		e.GetPolicy(),
+		res,
 	)
 
 	// load multiple policy patterns at once
@@ -226,9 +255,11 @@ func testLoadFilteredPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	})
 	require.NoError(t, err)
 	assert.True(t, e.IsFiltered())
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
-		e.GetPolicy(),
+		res,
 	)
 }
 
@@ -241,7 +272,9 @@ func testLoadFilteredGroupingPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer
 	})
 	require.NoError(t, err)
 	assert.True(t, e.IsFiltered())
-	assertPolicy(t, [][]string{}, e.GetGroupingPolicy())
+	res, err := e.GetGroupingPolicy()
+	require.NoError(t, err)
+	assertPolicy(t, [][]string{}, res)
 
 	e, err = casbin.NewEnforcer("testdata/rbac_model.conf", a)
 	require.NoError(t, err)
@@ -251,7 +284,9 @@ func testLoadFilteredGroupingPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer
 	})
 	require.NoError(t, err)
 	assert.True(t, e.IsFiltered())
-	assertPolicy(t, [][]string{{"alice", "data2_admin"}}, e.GetGroupingPolicy())
+	res, err = e.GetGroupingPolicy()
+	require.NoError(t, err)
+	assertPolicy(t, [][]string{{"alice", "data2_admin"}}, res)
 }
 
 func testLoadFilteredPolicyNilFilter(t *testing.T, a *Adapter, e *casbin.Enforcer) {
@@ -262,40 +297,48 @@ func testLoadFilteredPolicyNilFilter(t *testing.T, a *Adapter, e *casbin.Enforce
 	require.NoError(t, err)
 
 	assert.False(t, e.IsFiltered())
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
-		e.GetPolicy(),
+		res,
 	)
 }
 
 func testSavePolicyClearPreviousData(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	e.EnableAutoSave(false)
-	policies := e.GetPolicy()
+	policies, err := e.GetPolicy()
+	require.NoError(t, err)
 	// clone slice to avoid shufling elements
 	policies = append(policies[:0:0], policies...)
 	for _, p := range policies {
 		_, err := e.RemovePolicy(p)
 		require.NoError(t, err)
 	}
-	policies = e.GetGroupingPolicy()
+	policies, err = e.GetGroupingPolicy()
+	require.NoError(t, err)
 	policies = append(policies[:0:0], policies...)
 	for _, p := range policies {
 		_, err := e.RemoveGroupingPolicy(p)
 		require.NoError(t, err)
 	}
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{},
-		e.GetPolicy(),
+		res,
 	)
 
-	err := e.SavePolicy()
+	err = e.SavePolicy()
 	require.NoError(t, err)
 
 	err = e.LoadPolicy()
 	require.NoError(t, err)
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{},
-		e.GetPolicy(),
+		res,
 	)
 }
 
@@ -315,12 +358,16 @@ func testUpdatePolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	err = e.LoadPolicy()
 	require.NoError(t, err)
 
-	assertPolicy(t, e.GetPolicy(), [][]string{{"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}, {"bob", "data1", "read"}, {"alice", "data2", "write"}})
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
+	assertPolicy(t, res, [][]string{{"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}, {"bob", "data1", "read"}, {"alice", "data2", "write"}})
 
 	_, err = e.UpdatePolicy([]string{"bob", "data1", "read"}, []string{"alice", "data1", "read"})
 	require.NoError(t, err)
 
-	assertPolicy(t, e.GetPolicy(), [][]string{{"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}, {"alice", "data1", "read"}, {"alice", "data2", "write"}})
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
+	assertPolicy(t, res, [][]string{{"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}, {"alice", "data1", "read"}, {"alice", "data2", "write"}})
 }
 
 func testUpdatePolicyWithLoadFilteredPolicy(t *testing.T, a *Adapter, e *casbin.Enforcer) {
@@ -336,13 +383,17 @@ func testUpdatePolicyWithLoadFilteredPolicy(t *testing.T, a *Adapter, e *casbin.
 	err = e.LoadFilteredPolicy(&Filter{P: [][]string{{"data2_admin"}}})
 	require.NoError(t, err)
 
-	_, err = e.UpdatePolicies(e.GetPolicy(), [][]string{{"bob", "data2", "read"}, {"alice", "data2", "write"}})
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
+	_, err = e.UpdatePolicies(res, [][]string{{"bob", "data2", "read"}, {"alice", "data2", "write"}})
 	require.NoError(t, err)
 
 	err = e.LoadPolicy()
 	require.NoError(t, err)
 
-	assertPolicy(t, e.GetPolicy(), [][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"bob", "data2", "read"}, {"alice", "data2", "write"}})
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
+	assertPolicy(t, res, [][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"bob", "data2", "read"}, {"alice", "data2", "write"}})
 }
 
 func TestAdapter(t *testing.T) {
@@ -408,9 +459,11 @@ func TestCustomSchema(t *testing.T) {
 	e2, err := casbin.NewEnforcer("testdata/rbac_model.conf", a)
 	require.NoError(t, err)
 	assert.False(t, e2.IsFiltered())
+	res, err := e2.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
-		e2.GetPolicy(),
+		res,
 	)
 
 	// nothing found in public schema
@@ -420,9 +473,11 @@ func TestCustomSchema(t *testing.T) {
 	e3, err := casbin.NewEnforcer("testdata/rbac_model.conf", a)
 	require.NoError(t, err)
 	assert.False(t, e3.IsFiltered())
+	res, err = e3.GetPolicy()
+	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{},
-		e3.GetPolicy(),
+		res,
 	)
 }
 
