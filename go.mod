@@ -1,6 +1,6 @@
 module github.com/pckhoi/casbin-pgx-adapter/v3
 
-go 1.18
+go 1.24
 
 require (
 	github.com/casbin/casbin/v2 v2.98.0
