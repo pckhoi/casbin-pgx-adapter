@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/casbin/casbin/v2/model"
-	"github.com/casbin/casbin/v2/persist"
+	"github.com/casbin/casbin/v3/model"
+	"github.com/casbin/casbin/v3/persist"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mmcloughlin/meow"
@@ -23,6 +24,7 @@ const (
 )
 
 // Adapter represents the github.com/jackc/pgx/v5 adapter for policy storage.
+// Adapter is not safe for concurrent use by multiple enforcers; use one Adapter per enforcer or synchronize externally.
 type Adapter struct {
 	pool            *pgxpool.Pool
 	tableName       string
@@ -34,11 +36,25 @@ type Adapter struct {
 }
 
 type Filter struct {
-	P [][]string
-	G [][]string
+	P      [][]string
+	G      [][]string
+	Ptypes map[string][][]string
 }
 
 type Option func(a *Adapter)
+
+// The adapter satisfies both the plain and the context-aware casbin
+// persistence interfaces.
+var (
+	_ persist.Adapter                 = (*Adapter)(nil)
+	_ persist.FilteredAdapter         = (*Adapter)(nil)
+	_ persist.BatchAdapter            = (*Adapter)(nil)
+	_ persist.UpdatableAdapter        = (*Adapter)(nil)
+	_ persist.ContextAdapter          = (*Adapter)(nil)
+	_ persist.ContextFilteredAdapter  = (*Adapter)(nil)
+	_ persist.ContextBatchAdapter     = (*Adapter)(nil)
+	_ persist.ContextUpdatableAdapter = (*Adapter)(nil)
+)
 
 // NewAdapter creates a new adapter with connection conn which must either be a PostgreSQL
 // connection string or an instance of *pgx.ConnConfig from package github.com/jackc/pgx/v5.
@@ -115,18 +131,16 @@ func WithSchema(s string) Option {
 	}
 }
 
-func policyLine(ptype string, values ...string) string {
-	const sep = ", "
-	var sb strings.Builder
-	sb.WriteString(ptype)
+func policyArray(ptype string, values ...string) []string {
+	rule := make([]string, 1, 7)
+	rule[0] = ptype
 	for _, v := range values {
-		if len(v) == 0 {
+		if v == "" {
 			break
 		}
-		sb.WriteString(sep)
-		sb.WriteString(v)
+		rule = append(rule, v)
 	}
-	return sb.String()
+	return rule
 }
 
 func (a *Adapter) tableIdentifier() pgx.Identifier {
@@ -142,16 +156,21 @@ func (a *Adapter) schemaTable() string {
 
 // LoadPolicy loads policy from database.
 func (a *Adapter) LoadPolicy(model model.Model) error {
-	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+	return a.LoadPolicyCtx(context.Background(), model)
+}
+
+// LoadPolicyCtx loads all policy rules from the storage with context.
+func (a *Adapter) LoadPolicyCtx(ctx context.Context, model model.Model) error {
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
+
 	var pType, v0, v1, v2, v3, v4, v5 pgtype.Text
 	rows, err := a.pool.Query(ctx, fmt.Sprintf(`SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s`, a.schemaTable()))
 	if err != nil {
 		return err
 	}
-	_, err = pgx.ForEachRow(rows, []interface{}{&pType, &v0, &v1, &v2, &v3, &v4, &v5}, func() error {
-		persist.LoadPolicyLine(policyLine(pType.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
-		return nil
+	_, err = pgx.ForEachRow(rows, []any{&pType, &v0, &v1, &v2, &v3, &v4, &v5}, func() error {
+		return persist.LoadPolicyArray(policyArray(pType.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
 	})
 	if err != nil {
 		return err
@@ -168,35 +187,29 @@ func policyID(ptype string, rule []string) string {
 	return fmt.Sprintf("%x", sum)
 }
 
-func policyArgs(ptype string, rule []string) []interface{} {
-	row := make([]interface{}, 8)
-	row[0] = pgtype.Text{
-		String: policyID(ptype, rule),
-		Valid:  true,
-	}
-	row[1] = pgtype.Text{
-		String: ptype,
-		Valid:  true,
-	}
-	l := len(rule)
-	for i := 0; i < 6; i++ {
-		if i < l {
-			row[2+i] = pgtype.Text{
-				String: rule[i],
-				Valid:  true,
-			}
-		} else {
-			row[2+i] = pgtype.Text{
-				Valid: false,
-			}
-		}
+func policyArgs(ptype string, rule []string) []any {
+	// nil encodes as NULL for the columns beyond the rule's length
+	row := []any{policyID(ptype, rule), ptype, nil, nil, nil, nil, nil, nil}
+	for i := 0; i < len(rule) && i < 6; i++ {
+		row[2+i] = rule[i]
 	}
 	return row
 }
 
 // SavePolicy saves policy to database.
 func (a *Adapter) SavePolicy(model model.Model) error {
-	rows := [][]interface{}{}
+	return a.SavePolicyCtx(context.Background(), model)
+}
+
+// SavePolicyCtx saves all policy rules to the storage with context.
+func (a *Adapter) SavePolicyCtx(ctx context.Context, model model.Model) error {
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+
+	if a.filtered {
+		return errors.New("cannot save a filtered policy")
+	}
+	rows := [][]any{}
 	for ptype, ast := range model["p"] {
 		for _, rule := range ast.Policy {
 			rows = append(rows, policyArgs(ptype, rule))
@@ -208,15 +221,13 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
-	defer cancel()
 	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
-		_, err := tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.schemaTable()))
+		_, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.schemaTable()))
 		if err != nil {
 			return err
 		}
 		_, err = tx.CopyFrom(
-			context.Background(),
+			ctx,
 			a.tableIdentifier(),
 			[]string{"id", "p_type", "v0", "v1", "v2", "v3", "v4", "v5"},
 			pgx.CopyFromRows(rows),
@@ -234,25 +245,34 @@ func (a *Adapter) insertPolicyStmt() string {
 
 // AddPolicy adds a policy rule to the storage.
 func (a *Adapter) AddPolicy(sec string, ptype string, rule []string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+	return a.AddPolicyCtx(context.Background(), sec, ptype, rule)
+}
+
+// AddPolicyCtx adds a policy rule to the storage with context.
+func (a *Adapter) AddPolicyCtx(ctx context.Context, sec string, ptype string, rule []string) error {
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
-	_, err := a.pool.Exec(ctx,
-		a.insertPolicyStmt(),
-		policyArgs(ptype, rule)...,
-	)
+
+	_, err := a.pool.Exec(ctx, a.insertPolicyStmt(), policyArgs(ptype, rule)...)
 	return err
 }
 
 // AddPolicies adds policy rules to the storage.
 func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+	return a.AddPoliciesCtx(context.Background(), sec, ptype, rules)
+}
+
+// AddPoliciesCtx adds policy rules to the storage with context.
+func (a *Adapter) AddPoliciesCtx(ctx context.Context, sec string, ptype string, rules [][]string) error {
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
+
 	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		b := &pgx.Batch{}
 		for _, rule := range rules {
 			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
 		}
-		br := tx.SendBatch(context.Background(), b)
+		br := tx.SendBatch(ctx, b)
 		for range rules {
 			_, err := br.Exec()
 			if err != nil {
@@ -266,9 +286,15 @@ func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error 
 
 // RemovePolicy removes a policy rule from the storage.
 func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
-	id := policyID(ptype, rule)
-	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+	return a.RemovePolicyCtx(context.Background(), sec, ptype, rule)
+}
+
+// RemovePolicyCtx removes a policy rule from the storage with context.
+func (a *Adapter) RemovePolicyCtx(ctx context.Context, sec string, ptype string, rule []string) error {
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
+
+	id := policyID(ptype, rule)
 	_, err := a.pool.Exec(ctx,
 		fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()),
 		id,
@@ -278,14 +304,20 @@ func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 
 // RemovePolicies removes policy rules from the storage.
 func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+	return a.RemovePoliciesCtx(context.Background(), sec, ptype, rules)
+}
+
+// RemovePoliciesCtx removes policy rules from the storage with context.
+func (a *Adapter) RemovePoliciesCtx(ctx context.Context, sec string, ptype string, rules [][]string) error {
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
+
 	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		b := &pgx.Batch{}
 		for _, rule := range rules {
 			b.Queue(fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.schemaTable()), policyID(ptype, rule))
 		}
-		br := tx.SendBatch(context.Background(), b)
+		br := tx.SendBatch(ctx, b)
 		for range rules {
 			_, err := br.Exec()
 			if err != nil {
@@ -299,94 +331,137 @@ func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) err
 
 // RemoveFilteredPolicy removes policy rules that match the filter from the storage.
 func (a *Adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int, fieldValues ...string) error {
-	var sb strings.Builder
-	_, err := sb.WriteString(fmt.Sprintf("DELETE FROM %s WHERE p_type = $1", a.schemaTable()))
-	if err != nil {
-		return err
-	}
-	args := []interface{}{ptype}
+	return a.RemoveFilteredPolicyCtx(context.Background(), sec, ptype, fieldIndex, fieldValues...)
+}
 
-	idx := fieldIndex + len(fieldValues)
-	for i := 0; i < 6; i++ {
-		if fieldIndex <= i && idx > i && fieldValues[i-fieldIndex] != "" {
-			args = append(args, fieldValues[i-fieldIndex])
-			_, err = sb.WriteString(fmt.Sprintf(" AND v%d = $%d", i, len(args)))
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+// RemoveFilteredPolicyCtx removes policy rules that match the filter from the storage with context.
+func (a *Adapter) RemoveFilteredPolicyCtx(ctx context.Context, sec string, ptype string, fieldIndex int, fieldValues ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
-	_, err = a.pool.Exec(ctx, sb.String(), args...)
+
+	where, args := a.filteredWhere(ptype, fieldIndex, fieldValues)
+	_, err := a.pool.Exec(ctx, fmt.Sprintf("DELETE FROM %s", a.schemaTable())+where, args...)
 	return err
 }
 
-func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler func(string, model.Model) error) error {
-	var (
-		ptype, v0, v1, v2, v3, v4, v5 pgtype.Text
-		args                          []interface{}
-		sb                            = &strings.Builder{}
-	)
+// filteredWhere builds " WHERE p_type = $1 [AND vN = $n ...]" and its
+// arguments from a casbin filtered-operation selector. Empty fieldValues are
+// skipped (match any).
+func (a *Adapter) filteredWhere(ptype string, fieldIndex int, fieldValues []string) (string, []any) {
+	var sb strings.Builder
+	sb.WriteString(" WHERE p_type = $1")
+	args := []any{ptype}
+	for i, v := range fieldValues {
+		col := fieldIndex + i
+		if col > 5 {
+			break
+		}
+		if v == "" {
+			continue
+		}
+		args = append(args, v)
+		fmt.Fprintf(&sb, " AND v%d = $%d", col, len(args))
+	}
+	return sb.String(), args
+}
 
-	fmt.Fprintf(sb, `SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s WHERE `, a.schemaTable())
-
-	buildQuery := func(policies [][]string, ptype string) {
-		if len(policies) > 0 {
-			args = append(args, ptype)
-			fmt.Fprintf(sb, `(p_type = $%d AND (`, len(args))
-			for i, p := range policies {
-				fmt.Fprint(sb, `(`)
-				for j, v := range p {
-					if v == "" {
-						continue
-					}
-					args = append(args, v)
-					fmt.Fprintf(sb, `v%d = $%d`, j, len(args))
-					if j < len(p)-1 {
-						fmt.Fprint(sb, ` AND `)
-					}
-				}
-				fmt.Fprint(sb, `)`)
-				if i < len(policies)-1 {
-					fmt.Fprint(sb, ` OR `)
-				}
-			}
-			fmt.Fprint(sb, `))`)
+func (a *Adapter) filterQuery(filter *Filter) (string, []any) {
+	groups := map[string][][]string{}
+	if len(filter.P) > 0 {
+		groups["p"] = append(groups["p"], filter.P...)
+	}
+	if len(filter.G) > 0 {
+		groups["g"] = append(groups["g"], filter.G...)
+	}
+	for ptype, patterns := range filter.Ptypes {
+		if len(patterns) > 0 {
+			groups[ptype] = append(groups[ptype], patterns...)
 		}
 	}
 
-	buildQuery(filter.P, "p")
-	if len(filter.P) > 0 && len(filter.G) > 0 {
-		fmt.Fprint(sb, ` OR `)
-	}
-	buildQuery(filter.G, "g")
+	ptypes := slices.Sorted(maps.Keys(groups))
 
-	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
-	defer cancel()
-	rows, err := a.pool.Query(ctx, sb.String(), args...)
+	var args []any
+	groupClauses := make([]string, 0, len(groups))
+	for _, ptype := range ptypes {
+		args = append(args, ptype)
+		ptypeCond := fmt.Sprintf("p_type = $%d", len(args))
+
+		matchAll := false
+		for _, pattern := range groups[ptype] {
+			nonEmpty := false
+			for _, v := range pattern {
+				if v != "" {
+					nonEmpty = true
+					break
+				}
+			}
+			if !nonEmpty {
+				matchAll = true
+				break
+			}
+		}
+		if matchAll {
+			groupClauses = append(groupClauses, "("+ptypeCond+")")
+			continue
+		}
+
+		patternClauses := make([]string, 0, len(groups[ptype]))
+		for _, pattern := range groups[ptype] {
+			var conds []string
+			for i, v := range pattern {
+				if i > 5 {
+					break
+				}
+				if v == "" {
+					continue
+				}
+				args = append(args, v)
+				conds = append(conds, fmt.Sprintf("v%d = $%d", i, len(args)))
+			}
+			patternClauses = append(patternClauses, "("+strings.Join(conds, " AND ")+")")
+		}
+		groupClauses = append(groupClauses, "("+ptypeCond+" AND ("+strings.Join(patternClauses, " OR ")+"))")
+	}
+
+	query := fmt.Sprintf(`SELECT "p_type", "v0", "v1", "v2", "v3", "v4", "v5" FROM %s`, a.schemaTable())
+	if len(groupClauses) > 0 {
+		query += " WHERE " + strings.Join(groupClauses, " OR ")
+	}
+	return query, args
+}
+
+func (a *Adapter) loadFilteredPolicy(ctx context.Context, model model.Model, filter *Filter) error {
+	query, args := a.filterQuery(filter)
+	rows, err := a.pool.Query(ctx, query, args...)
 	if err != nil {
 		return err
 	}
-	_, err = pgx.ForEachRow(rows, []interface{}{&ptype, &v0, &v1, &v2, &v3, &v4, &v5}, func() error {
-		handler(policyLine(ptype.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
-		return nil
+	var ptype, v0, v1, v2, v3, v4, v5 pgtype.Text
+	_, err = pgx.ForEachRow(rows, []any{&ptype, &v0, &v1, &v2, &v3, &v4, &v5}, func() error {
+		return persist.LoadPolicyArray(policyArray(ptype.String, v0.String, v1.String, v2.String, v3.String, v4.String, v5.String), model)
 	})
 	return err
 }
 
-// LoadFilteredPolicy can query policies with a filter. Make sure that filter is of type *pgxadapter.Filter
-func (a *Adapter) LoadFilteredPolicy(model model.Model, filter interface{}) error {
+// LoadFilteredPolicy can query policies with a filter.
+func (a *Adapter) LoadFilteredPolicy(model model.Model, filter any) error {
+	return a.LoadFilteredPolicyCtx(context.Background(), model, filter)
+}
+
+// LoadFilteredPolicyCtx can query policies with a filter with context.
+func (a *Adapter) LoadFilteredPolicyCtx(ctx context.Context, model model.Model, filter any) error {
 	if filter == nil {
-		return a.LoadPolicy(model)
+		return a.LoadPolicyCtx(ctx, model)
 	}
 
 	filterValue, ok := filter.(*Filter)
 	if !ok {
 		return fmt.Errorf("filter must be of type *pgxadapter.Filter")
 	}
-	err := a.loadFilteredPolicy(model, filterValue, persist.LoadPolicyLine)
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+	err := a.loadFilteredPolicy(ctx, model, filterValue)
 	if err != nil {
 		return err
 	}
@@ -394,19 +469,37 @@ func (a *Adapter) LoadFilteredPolicy(model model.Model, filter interface{}) erro
 	return nil
 }
 
+// IsFiltered returns true if the loaded policy has been filtered.
 func (a *Adapter) IsFiltered() bool {
+	return a.IsFilteredCtx(context.Background())
+}
+
+// IsFilteredCtx returns true if the loaded policy has been filtered.
+func (a *Adapter) IsFilteredCtx(ctx context.Context) bool {
 	return a.filtered
 }
 
 // UpdatePolicy updates a policy rule from storage.
-// This is part of the Auto-Save feature.
 func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []string) error {
-	return a.UpdatePolicies(sec, ptype, [][]string{oldRule}, [][]string{newPolicy})
+	return a.UpdatePolicyCtx(context.Background(), sec, ptype, oldRule, newPolicy)
+}
+
+// UpdatePolicyCtx updates a policy rule from storage with context.
+func (a *Adapter) UpdatePolicyCtx(ctx context.Context, sec string, ptype string, oldRule, newPolicy []string) error {
+	return a.UpdatePoliciesCtx(ctx, sec, ptype, [][]string{oldRule}, [][]string{newPolicy})
 }
 
 // UpdatePolicies updates some policy rules to storage, like db, redis.
 func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules [][]string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+	return a.UpdatePoliciesCtx(context.Background(), sec, ptype, oldRules, newRules)
+}
+
+// UpdatePoliciesCtx updates some policy rules to storage, like db, redis, with context.
+func (a *Adapter) UpdatePoliciesCtx(ctx context.Context, sec string, ptype string, oldRules, newRules [][]string) error {
+	if len(oldRules) != len(newRules) {
+		return errors.New("old rules size not equal to new rules size")
+	}
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
 	return pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		b := &pgx.Batch{}
@@ -416,7 +509,7 @@ func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules []
 		for _, rule := range newRules {
 			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
 		}
-		br := tx.SendBatch(context.Background(), b)
+		br := tx.SendBatch(ctx, b)
 		for i := 0; i < b.Len(); i++ {
 			_, err := br.Exec()
 			if err != nil {
@@ -428,9 +521,57 @@ func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules []
 	})
 }
 
-// UpdateFilteredPolicies deletes old rules and adds new rules.
-func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
-	return nil, fmt.Errorf("not implemented")
+// UpdateFilteredPolicies deletes old rules matching the filter and adds new rules in a single transaction.
+func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newRules [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
+	return a.UpdateFilteredPoliciesCtx(context.Background(), sec, ptype, newRules, fieldIndex, fieldValues...)
+}
+
+// UpdateFilteredPoliciesCtx deletes old rules matching the filter and adds new rules in a single transaction, with context.
+func (a *Adapter) UpdateFilteredPoliciesCtx(ctx context.Context, sec string, ptype string, newRules [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, a.timeout)
+	defer cancel()
+
+	where, args := a.filteredWhere(ptype, fieldIndex, fieldValues)
+	query := fmt.Sprintf("DELETE FROM %s", a.schemaTable()) + where + " RETURNING v0, v1, v2, v3, v4, v5"
+
+	var oldRules [][]string
+	err := pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		var v0, v1, v2, v3, v4, v5 pgtype.Text
+		if _, err = pgx.ForEachRow(rows, []any{&v0, &v1, &v2, &v3, &v4, &v5}, func() error {
+			rule := make([]string, 0, 6)
+			for _, v := range []string{v0.String, v1.String, v2.String, v3.String, v4.String, v5.String} {
+				if v == "" {
+					break
+				}
+				rule = append(rule, v)
+			}
+			oldRules = append(oldRules, rule)
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		b := &pgx.Batch{}
+		for _, rule := range newRules {
+			b.Queue(a.insertPolicyStmt(), policyArgs(ptype, rule)...)
+		}
+		br := tx.SendBatch(ctx, b)
+		for range newRules {
+			if _, err := br.Exec(); err != nil {
+				br.Close()
+				return err
+			}
+		}
+		return br.Close()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return oldRules, nil
 }
 
 func (a *Adapter) Close() {
@@ -456,14 +597,10 @@ func (a *Adapter) createTable() error {
 		exists := false
 		ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 		defer cancel()
-		if err := a.pool.QueryRow(ctx, fmt.Sprintf(
-			"SELECT EXISTS (SELECT COUNT(*) FROM (SELECT FROM %s LIMIT 1) a)",
-			ident.Sanitize()),
+		if err := a.pool.QueryRow(ctx,
+			"SELECT to_regclass($1) IS NOT NULL", ident.Sanitize(),
 		).Scan(&exists); err != nil {
-			var pgErr *pgconn.PgError
-			if !errors.As(err, &pgErr) || pgErr.Code != "42P01" {
-				return err
-			}
+			return err
 		}
 		if exists {
 			return fmt.Errorf("found table with similar name only in lower case: %q. Either use this table name exactly, or choose a different name", lowerTableName)
@@ -486,7 +623,7 @@ func (a *Adapter) createTable() error {
 	return err
 }
 
-func createDatabase(dbname string, arg interface{}) (*pgxpool.Pool, error) {
+func createDatabase(dbname string, arg any) (*pgxpool.Pool, error) {
 	var conn *pgx.Conn
 	var err error
 	ctx := context.Background()

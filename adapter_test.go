@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
-	"github.com/casbin/casbin/v2"
-	"github.com/casbin/casbin/v2/util"
+	"github.com/casbin/casbin/v3"
+	"github.com/casbin/casbin/v3/model"
+	"github.com/casbin/casbin/v3/util"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,7 +27,8 @@ func dropDB(t *testing.T, dbname string) {
 
 func assertPolicy(t *testing.T, expected, res [][]string) {
 	t.Helper()
-	assert.True(t, util.Array2DEquals(expected, res), "Policy Got: %v, supposed to be %v", res, expected)
+	// casbin v3 swap-removes rules in memory, so policy order is not stable
+	assert.True(t, util.SortedArray2DEquals(expected, res), "Policy Got: %v, supposed to be %v", res, expected)
 }
 
 func testSaveLoad(t *testing.T, a *Adapter, e *casbin.Enforcer) {
@@ -34,6 +37,41 @@ func testSaveLoad(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	require.NoError(t, err)
 	assertPolicy(t,
 		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
+		res,
+	)
+}
+
+func testSpecialCharacterValues(t *testing.T, a *Adapter, e *casbin.Enforcer) {
+	// values containing commas and quotes must round-trip unmangled
+	_, err := e.AddPolicy("alice", "data/with,comma", `quo"ted`)
+	require.NoError(t, err)
+
+	err = e.LoadPolicy()
+	require.NoError(t, err)
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
+	assertPolicy(t,
+		[][]string{
+			{"alice", "data1", "read"}, {"bob", "data2", "write"},
+			{"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"},
+			{"alice", "data/with,comma", `quo"ted`},
+		},
+		res,
+	)
+
+	// the bulk SavePolicy (CopyFrom) path must round-trip too
+	err = e.SavePolicy()
+	require.NoError(t, err)
+	err = e.LoadPolicy()
+	require.NoError(t, err)
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
+	assertPolicy(t,
+		[][]string{
+			{"alice", "data1", "read"}, {"bob", "data2", "write"},
+			{"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"},
+			{"alice", "data/with,comma", `quo"ted`},
+		},
 		res,
 	)
 }
@@ -133,7 +171,7 @@ func testCustomDatabaseAndTableName(t *testing.T, a *Adapter, e *casbin.Enforcer
 	policies := [][]string{}
 	rows, err := conn.Query(context.Background(), "SELECT v0, v1, v2 FROM test_casbin_rules WHERE p_type = $1", "p")
 	require.NoError(t, err)
-	pgx.ForEachRow(rows, []interface{}{&v0, &v1, &v2}, func() error {
+	pgx.ForEachRow(rows, []any{&v0, &v1, &v2}, func() error {
 		policies = append(policies, []string{v0, v1, v2})
 		return nil
 	})
@@ -305,6 +343,49 @@ func testLoadFilteredPolicyNilFilter(t *testing.T, a *Adapter, e *casbin.Enforce
 	)
 }
 
+func testLoadFilteredPolicyEdgeCases(t *testing.T, a *Adapter, e *casbin.Enforcer) {
+	// trailing empty value in a pattern must not generate invalid SQL
+	e, err := casbin.NewEnforcer("testdata/rbac_model.conf", a)
+	require.NoError(t, err)
+	err = e.LoadFilteredPolicy(&Filter{
+		P: [][]string{{"alice", ""}},
+	})
+	require.NoError(t, err)
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
+	assertPolicy(t, [][]string{{"alice", "data1", "read"}}, res)
+
+	// an all-empty pattern matches every rule of its ptype
+	e, err = casbin.NewEnforcer("testdata/rbac_model.conf", a)
+	require.NoError(t, err)
+	err = e.LoadFilteredPolicy(&Filter{
+		P: [][]string{{""}},
+	})
+	require.NoError(t, err)
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
+	assertPolicy(t,
+		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
+		res,
+	)
+
+	// an empty filter loads everything but still marks the enforcer filtered
+	e, err = casbin.NewEnforcer("testdata/rbac_model.conf", a)
+	require.NoError(t, err)
+	err = e.LoadFilteredPolicy(&Filter{})
+	require.NoError(t, err)
+	assert.True(t, e.IsFiltered())
+	res, err = e.GetPolicy()
+	require.NoError(t, err)
+	assertPolicy(t,
+		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
+		res,
+	)
+	g, err := e.GetGroupingPolicy()
+	require.NoError(t, err)
+	assertPolicy(t, [][]string{{"alice", "data2_admin"}}, g)
+}
+
 func testSavePolicyClearPreviousData(t *testing.T, a *Adapter, e *casbin.Enforcer) {
 	e.EnableAutoSave(false)
 	policies, err := e.GetPolicy()
@@ -396,6 +477,70 @@ func testUpdatePolicyWithLoadFilteredPolicy(t *testing.T, a *Adapter, e *casbin.
 	assertPolicy(t, res, [][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"bob", "data2", "read"}, {"alice", "data2", "write"}})
 }
 
+func testSaveFilteredPolicyError(t *testing.T, a *Adapter, e *casbin.Enforcer) {
+	e, err := casbin.NewEnforcer("testdata/rbac_model.conf", a)
+	require.NoError(t, err)
+	err = e.LoadFilteredPolicy(&Filter{P: [][]string{{"alice"}}})
+	require.NoError(t, err)
+
+	// saving a filtered snapshot would silently drop every other rule
+	err = a.SavePolicy(e.GetModel())
+	require.EqualError(t, err, "cannot save a filtered policy")
+}
+
+func testUpdatePoliciesLengthMismatch(t *testing.T, a *Adapter, e *casbin.Enforcer) {
+	err := a.UpdatePolicies("p", "p", [][]string{{"alice", "data1", "read"}}, [][]string{})
+	require.EqualError(t, err, "old rules size not equal to new rules size")
+}
+
+func testUpdateFilteredPolicies(t *testing.T, a *Adapter, e *casbin.Enforcer) {
+	updated, err := e.UpdateFilteredPolicies([][]string{{"alice", "data1", "write"}}, 0, "alice")
+	require.NoError(t, err)
+	assert.True(t, updated)
+
+	// reload from storage: alice's old rule is gone, the new one persisted
+	err = e.LoadPolicy()
+	require.NoError(t, err)
+	res, err := e.GetPolicy()
+	require.NoError(t, err)
+	assertPolicy(t,
+		[][]string{{"alice", "data1", "write"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}},
+		res,
+	)
+
+	// direct adapter call returns the removed rules (values only, no ptype)
+	old, err := a.UpdateFilteredPolicies("p", "p", [][]string{{"bob", "data2", "read"}}, 0, "bob")
+	require.NoError(t, err)
+	assertPolicy(t, [][]string{{"bob", "data2", "write"}}, old)
+}
+
+func testContextMethods(t *testing.T, a *Adapter, e *casbin.Enforcer) {
+	// a cancelled context must abort the operation
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := a.AddPolicyCtx(cancelled, "p", "p", []string{"carol", "data3", "read"})
+	require.ErrorIs(t, err, context.Canceled)
+
+	// the configured adapter timeout must also bound Ctx operations
+	origTimeout := a.timeout
+	a.timeout = time.Nanosecond
+	err = a.AddPolicyCtx(context.Background(), "p", "p", []string{"dave", "data4", "read"})
+	a.timeout = origTimeout
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// happy path: caller-supplied context is honored
+	err = a.AddPolicyCtx(context.Background(), "p", "p", []string{"carol", "data3", "read"})
+	require.NoError(t, err)
+	e2, err := casbin.NewEnforcer("testdata/rbac_model.conf", a)
+	require.NoError(t, err)
+	res, err := e2.GetPolicy()
+	require.NoError(t, err)
+	assertPolicy(t,
+		[][]string{{"alice", "data1", "read"}, {"bob", "data2", "write"}, {"data2_admin", "data2", "read"}, {"data2_admin", "data2", "write"}, {"carol", "data3", "read"}},
+		res,
+	)
+}
+
 func TestAdapter(t *testing.T) {
 	connStr := os.Getenv("PG_CONN")
 	require.NotEmpty(t, connStr, "must run with non-empty PG_CONN")
@@ -415,6 +560,7 @@ func TestAdapter(t *testing.T) {
 	t.Run("", func(t *testing.T) {
 		for _, st := range []subtest{
 			{"SaveLoad", testSaveLoad},
+			{"SpecialCharacterValues", testSpecialCharacterValues},
 			{"AutoSave", testAutoSave},
 			{"RemovePolicy", testRemovePolicy},
 			{"RemoveFilteredPolicy", testRemoveFilteredPolicy},
@@ -422,9 +568,14 @@ func TestAdapter(t *testing.T) {
 			{"LoadFilteredPolicy", testLoadFilteredPolicy},
 			{"LoadFilteredGroupingPolicy", testLoadFilteredGroupingPolicy},
 			{"LoadFilteredPolicyNilFilter", testLoadFilteredPolicyNilFilter},
+			{"LoadFilteredPolicyEdgeCases", testLoadFilteredPolicyEdgeCases},
 			{"SavePolicyClearPreviousData", testSavePolicyClearPreviousData},
 			{"UpdatePolicy", testUpdatePolicy},
 			{"UpdatePolicyWithLoadFilteredPolicy", testUpdatePolicyWithLoadFilteredPolicy},
+			{"SaveFilteredPolicyError", testSaveFilteredPolicyError},
+			{"UpdatePoliciesLengthMismatch", testUpdatePoliciesLengthMismatch},
+			{"UpdateFilteredPolicies", testUpdateFilteredPolicies},
+			{"ContextMethods", testContextMethods},
 			{"CustomDatabaseAndTableName", testCustomDatabaseAndTableName},
 		} {
 			st := st
@@ -432,6 +583,9 @@ func TestAdapter(t *testing.T) {
 				// This is a trick to save the current policy to the DB.
 				// We can't call e.SavePolicy() because the adapter in the enforcer is still the file adapter.
 				// The current policy means the policy in the Casbin enforcer (aka in memory).
+				// reset filtered state a previous subtest may have left, so the
+				// seeding SavePolicy below is allowed and e2 loads normally
+				a.filtered = false
 				err = a.SavePolicy(e.GetModel())
 				require.NoError(t, err)
 				e2, err := casbin.NewEnforcer("testdata/rbac_model.conf", a)
@@ -510,4 +664,42 @@ func TestRejectCollidingTableName(t *testing.T) {
 	a, err := NewAdapter(connStr, WithDatabase(dbName), WithTableName("test_casbin_rules"))
 	require.NoError(t, err)
 	defer a.Close()
+}
+
+const multiPtypeModel = `
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+p2 = sub, obj, act
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
+`
+
+func TestLoadFilteredPolicyPtypes(t *testing.T) {
+	connStr := os.Getenv("PG_CONN")
+	require.NotEmpty(t, connStr, "must run with non-empty PG_CONN")
+	defer dropDB(t, "test_pgxadapter")
+	a, err := NewAdapter(connStr, WithDatabase("test_pgxadapter"), WithTableName("test_casbin_rules"))
+	require.NoError(t, err)
+	defer a.Close()
+
+	require.NoError(t, a.AddPolicy("p", "p", []string{"alice", "data1", "read"}))
+	require.NoError(t, a.AddPolicy("p", "p2", []string{"bob", "data2", "write"}))
+	require.NoError(t, a.AddPolicy("p", "p2", []string{"carol", "data3", "read"}))
+
+	m, err := model.NewModelFromString(multiPtypeModel)
+	require.NoError(t, err)
+	err = a.LoadFilteredPolicy(m, &Filter{
+		Ptypes: map[string][][]string{"p2": {{"carol"}}},
+	})
+	require.NoError(t, err)
+	assert.True(t, a.IsFiltered())
+	assertPolicy(t, [][]string{}, m["p"]["p"].Policy)
+	assertPolicy(t, [][]string{{"carol", "data3", "read"}}, m["p"]["p2"].Policy)
 }
